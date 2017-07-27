@@ -128,6 +128,11 @@ func UnmarshalManyPayload(in io.Reader, t reflect.Type) ([]interface{}, error) {
 	return models, nil
 }
 
+// unmarshalNode handles embedded struct models from top to down.
+// it loops through the struct fields, handles attributes/relations at that level first
+// the handling the embedded structs are done last, so that you get the expected composition behavior
+// data (*Node) attributes are cleared on each success.
+// relations/sideloaded models use deeply copied Nodes (since those sideloaded models can be referenced in multiple relations)
 func unmarshalNode(data *Node, model reflect.Value, included *map[string]*Node) (err error) {
 
 	defer func() {
@@ -139,230 +144,329 @@ func unmarshalNode(data *Node, model reflect.Value, included *map[string]*Node) 
 	modelValue := model.Elem()
 	modelType := model.Type().Elem()
 
-	var er error
+	type embedded struct {
+		structField, model reflect.Value
+	}
+	embeddeds := []*embedded{}
 
 	for i := 0; i < modelValue.NumField(); i++ {
 		fieldType := modelType.Field(i)
-		tag := fieldType.Tag.Get("jsonapi")
+		fieldValue := modelValue.Field(i)
+		tag := fieldType.Tag.Get(annotationJSONAPI)
+
+		// handle explicit ignore annotation
+		if shouldIgnoreField(tag) {
+			continue
+		}
+
+		// handles embedded structs
+		if isEmbeddedStruct(fieldType) {
+			embeddeds = append(embeddeds,
+				&embedded{
+					model:       reflect.ValueOf(fieldValue.Addr().Interface()),
+					structField: fieldValue,
+				},
+			)
+			continue
+		}
+
+		// handles pointers to embedded structs
+		if isEmbeddedStructPtr(fieldType) {
+			embeddeds = append(embeddeds,
+				&embedded{
+					model:       reflect.ValueOf(fieldValue.Interface()),
+					structField: fieldValue,
+				},
+			)
+			continue
+		}
+
+		// handle tagless; after handling embedded structs (which could be tagless)
 		if tag == "" {
 			continue
 		}
 
-		fieldValue := modelValue.Field(i)
-
-		args := strings.Split(tag, ",")
+		args := strings.Split(tag, annotationSeperator)
+		// require atleast 1
 		if len(args) < 1 {
-			er = ErrBadJSONAPIStructTag
-			break
+			return ErrBadJSONAPIStructTag
 		}
 
-		annotation := args[0]
-
-		if (annotation == annotationClientID && len(args) != 1) ||
-			(annotation != annotationClientID && len(args) < 2) {
-			er = ErrBadJSONAPIStructTag
-			break
-		}
-
-		if annotation == annotationPrimary {
-			if data.ID == "" {
-				continue
+		// args[0] == annotation
+		switch args[0] {
+		case annotationClientID:
+			if err := handleClientIDUnmarshal(data, args, fieldValue); err != nil {
+				return err
 			}
-
-			// Check the JSON API Type
-			if data.Type != args[1] {
-				er = fmt.Errorf(
-					"Trying to Unmarshal an object of type %#v, but %#v does not match",
-					data.Type,
-					args[1],
-				)
-				break
+		case annotationPrimary:
+			if err := handlePrimaryUnmarshal(data, args, fieldType, fieldValue); err != nil {
+				return err
 			}
-
-			// ID will have to be transmitted as astring per the JSON API spec
-			v := reflect.ValueOf(data.ID)
-
-			// Deal with PTRS
-			var kind reflect.Kind
-			if fieldValue.Kind() == reflect.Ptr {
-				kind = fieldType.Type.Elem().Kind()
-			} else {
-				kind = fieldType.Type.Kind()
+		case annotationAttribute:
+			if err := handleAttributeUnmarshal(data, args, fieldType, fieldValue); err != nil {
+				return err
 			}
-
-			// Handle String case
-			if kind == reflect.String {
-				assign(fieldValue, v)
-				continue
+		case annotationRelation:
+			if err := handleRelationUnmarshal(data, args, fieldValue, included); err != nil {
+				return err
 			}
-
-			// Value was not a string... only other supported type was a numeric,
-			// which would have been sent as a float value.
-			floatValue, err := strconv.ParseFloat(data.ID, 64)
-			if err != nil {
-				// Could not convert the value in the "id" attr to a float
-				er = ErrBadJSONAPIID
-				break
-			}
-
-			// Convert the numeric float to one of the supported ID numeric types
-			// (int[8,16,32,64] or uint[8,16,32,64])
-			var idValue reflect.Value
-			switch kind {
-			case reflect.Int:
-				n := int(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Int8:
-				n := int8(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Int16:
-				n := int16(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Int32:
-				n := int32(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Int64:
-				n := int64(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Uint:
-				n := uint(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Uint8:
-				n := uint8(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Uint16:
-				n := uint16(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Uint32:
-				n := uint32(floatValue)
-				idValue = reflect.ValueOf(&n)
-			case reflect.Uint64:
-				n := uint64(floatValue)
-				idValue = reflect.ValueOf(&n)
-			default:
-				// We had a JSON float (numeric), but our field was not one of the
-				// allowed numeric types
-				er = ErrBadJSONAPIID
-				break
-			}
-
-			assign(fieldValue, idValue)
-		} else if annotation == annotationClientID {
-			if data.ClientID == "" {
-				continue
-			}
-
-			fieldValue.Set(reflect.ValueOf(data.ClientID))
-		} else if annotation == annotationAttribute {
-			attributes := data.Attributes
-
-			if attributes == nil || len(data.Attributes) == 0 {
-				continue
-			}
-
-			attribute := attributes[args[1]]
-
-			// continue if the attribute was not included in the request
-			if attribute == nil {
-				continue
-			}
-
-			structField := fieldType
-			value, err := unmarshalAttribute(attribute, args, structField, fieldValue)
-			if err != nil {
-				er = err
-				break
-			}
-
-			assign(fieldValue, value)
-			continue
-
-		} else if annotation == annotationRelation {
-			isSlice := fieldValue.Type().Kind() == reflect.Slice
-
-			if data.Relationships == nil || data.Relationships[args[1]] == nil {
-				continue
-			}
-
-			if isSlice {
-				// to-many relationship
-				relationship := new(RelationshipManyNode)
-
-				buf := bytes.NewBuffer(nil)
-
-				json.NewEncoder(buf).Encode(data.Relationships[args[1]])
-				json.NewDecoder(buf).Decode(relationship)
-
-				data := relationship.Data
-				models := reflect.New(fieldValue.Type()).Elem()
-
-				for _, n := range data {
-					m := reflect.New(fieldValue.Type().Elem().Elem())
-
-					if err := unmarshalNode(
-						fullNode(n, included),
-						m,
-						included,
-					); err != nil {
-						er = err
-						break
-					}
-
-					models = reflect.Append(models, m)
-				}
-
-				fieldValue.Set(models)
-			} else {
-				// to-one relationships
-				relationship := new(RelationshipOneNode)
-
-				buf := bytes.NewBuffer(nil)
-
-				json.NewEncoder(buf).Encode(
-					data.Relationships[args[1]],
-				)
-				json.NewDecoder(buf).Decode(relationship)
-
-				/*
-					http://jsonapi.org/format/#document-resource-object-relationships
-					http://jsonapi.org/format/#document-resource-object-linkage
-					relationship can have a data node set to null (e.g. to disassociate the relationship)
-					so unmarshal and set fieldValue only if data obj is not null
-				*/
-				if relationship.Data == nil {
-					continue
-				}
-
-				m := reflect.New(fieldValue.Type().Elem())
-				if err := unmarshalNode(
-					fullNode(relationship.Data, included),
-					m,
-					included,
-				); err != nil {
-					er = err
-					break
-				}
-
-				fieldValue.Set(m)
-
-			}
-
-		} else {
-			er = fmt.Errorf(unsuportedStructTagMsg, annotation)
+		default:
+			return fmt.Errorf(unsuportedStructTagMsg, args[0])
 		}
 	}
 
-	return er
+	// handle embedded last
+	for _, em := range embeddeds {
+		// if nil, need to construct and rollback accordingly
+		if em.model.IsNil() {
+			copy := deepCopyNode(data)
+			tmp := reflect.New(em.model.Type().Elem())
+			if err := unmarshalNode(copy, tmp, included); err != nil {
+				return err
+			}
+
+			// had changes; assign value to struct field, replace orig node (data) w/ mutated copy
+			if !reflect.DeepEqual(copy, data) {
+				assign(em.structField, tmp)
+				data = copy
+			}
+			return nil
+		}
+		// handle non-nil scenarios
+		return unmarshalNode(data, em.model, included)
+	}
+
+	return nil
+}
+
+func handleClientIDUnmarshal(data *Node, args []string, fieldValue reflect.Value) error {
+	if len(args) != 1 {
+		return ErrBadJSONAPIStructTag
+	}
+
+	if data.ClientID == "" {
+		return nil
+	}
+
+	// set value and clear clientID to denote it's already been processed
+	fieldValue.Set(reflect.ValueOf(data.ClientID))
+	data.ClientID = ""
+
+	return nil
+}
+
+func handlePrimaryUnmarshal(data *Node, args []string, fieldType reflect.StructField, fieldValue reflect.Value) error {
+	if len(args) < 2 {
+		return ErrBadJSONAPIStructTag
+	}
+
+	if data.ID == "" {
+		return nil
+	}
+
+	// Check the JSON API Type
+	if data.Type != args[1] {
+		return fmt.Errorf(
+			"Trying to Unmarshal an object of type %#v, but %#v does not match",
+			data.Type,
+			args[1],
+		)
+	}
+
+	// Deal with PTRS
+	var kind reflect.Kind
+	if fieldValue.Kind() == reflect.Ptr {
+		kind = fieldType.Type.Elem().Kind()
+	} else {
+		kind = fieldType.Type.Kind()
+	}
+
+	var idValue reflect.Value
+
+	// Handle String case
+	if kind == reflect.String {
+		// ID will have to be transmitted as a string per the JSON API spec
+		idValue = reflect.ValueOf(data.ID)
+	} else {
+		// Value was not a string... only other supported type was a numeric,
+		// which would have been sent as a float value.
+		floatValue, err := strconv.ParseFloat(data.ID, 64)
+		if err != nil {
+			// Could not convert the value in the "id" attr to a float
+			return ErrBadJSONAPIID
+		}
+
+		// Convert the numeric float to one of the supported ID numeric types
+		// (int[8,16,32,64] or uint[8,16,32,64])
+		switch kind {
+		case reflect.Int:
+			n := int(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Int8:
+			n := int8(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Int16:
+			n := int16(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Int32:
+			n := int32(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Int64:
+			n := int64(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Uint:
+			n := uint(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Uint8:
+			n := uint8(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Uint16:
+			n := uint16(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Uint32:
+			n := uint32(floatValue)
+			idValue = reflect.ValueOf(&n)
+		case reflect.Uint64:
+			n := uint64(floatValue)
+			idValue = reflect.ValueOf(&n)
+		default:
+			// We had a JSON float (numeric), but our field was not one of the
+			// allowed numeric types
+			return ErrBadJSONAPIID
+		}
+	}
+
+	// set value and clear ID to denote it's already been processed
+	assign(fieldValue, idValue)
+	data.ID = ""
+
+	return nil
+}
+
+func handleRelationUnmarshal(data *Node, args []string, fieldValue reflect.Value, included *map[string]*Node) error {
+	if len(args) < 2 {
+		return ErrBadJSONAPIStructTag
+	}
+
+	if data.Relationships == nil || data.Relationships[args[1]] == nil {
+		return nil
+	}
+
+	// to-one relationships
+	handler := handleToOneRelationUnmarshal
+	isSlice := fieldValue.Type().Kind() == reflect.Slice
+	if isSlice {
+		// to-many relationship
+		handler = handleToManyRelationUnmarshal
+	}
+
+	v, err := handler(data.Relationships[args[1]], fieldValue.Type(), included)
+	if err != nil {
+		return err
+	}
+	// set only if there is a val since val can be null (e.g. to disassociate the relationship)
+	if v != nil {
+		fieldValue.Set(*v)
+	}
+	delete(data.Relationships, args[1])
+	return nil
+}
+
+// to-one relationships
+func handleToOneRelationUnmarshal(relationData interface{}, fieldType reflect.Type, included *map[string]*Node) (*reflect.Value, error) {
+	relationship := new(RelationshipOneNode)
+
+	buf := bytes.NewBuffer(nil)
+	json.NewEncoder(buf).Encode(relationData)
+	json.NewDecoder(buf).Decode(relationship)
+
+	m := reflect.New(fieldType.Elem())
+	/*
+		http://jsonapi.org/format/#document-resource-object-relationships
+		http://jsonapi.org/format/#document-resource-object-linkage
+		relationship can have a data node set to null (e.g. to disassociate the relationship)
+		so unmarshal and set fieldValue only if data obj is not null
+	*/
+	if relationship.Data == nil {
+		return nil, nil
+	}
+
+	if err := unmarshalNode(
+		fullNode(relationship.Data, included),
+		m,
+		included,
+	); err != nil {
+		return nil, err
+	}
+
+	return &m, nil
+}
+
+// to-many relationship
+func handleToManyRelationUnmarshal(relationData interface{}, fieldType reflect.Type, included *map[string]*Node) (*reflect.Value, error) {
+	relationship := new(RelationshipManyNode)
+
+	buf := bytes.NewBuffer(nil)
+	json.NewEncoder(buf).Encode(relationData)
+	json.NewDecoder(buf).Decode(relationship)
+
+	models := reflect.New(fieldType).Elem()
+
+	rData := relationship.Data
+	for _, n := range rData {
+		m := reflect.New(fieldType.Elem().Elem())
+
+		if err := unmarshalNode(
+			fullNode(n, included),
+			m,
+			included,
+		); err != nil {
+			return nil, err
+		}
+
+		models = reflect.Append(models, m)
+	}
+
+	return &models, nil
+}
+
+// TODO: break this out into smaller funcs
+func handleAttributeUnmarshal(data *Node, args []string, fieldType reflect.StructField, fieldValue reflect.Value) error {
+	if len(args) < 2 {
+		return ErrBadJSONAPIStructTag
+	}
+	attributes := data.Attributes
+	if attributes == nil || len(data.Attributes) == 0 {
+		return nil
+	}
+
+	attribute := attributes[args[1]]
+
+	// continue if the attribute was not included in the request
+	if attribute == nil {
+		return nil
+	}
+
+	structField := fieldType
+	value, err := unmarshalAttribute(attribute, args, structField, fieldValue)
+	if err != nil {
+		return err
+	}
+
+	// set val and clear attribute key so its not processed again
+	assign(fieldValue, value)
+	delete(data.Attributes, args[1])
+	return nil
 }
 
 func fullNode(n *Node, included *map[string]*Node) *Node {
 	includedKey := fmt.Sprintf("%s,%s", n.Type, n.ID)
 
 	if included != nil && (*included)[includedKey] != nil {
-		return (*included)[includedKey]
+		return deepCopyNode((*included)[includedKey])
 	}
 
-	return n
+	return deepCopyNode(n)
 }
 
 // assign will take the value specified and assign it to the field; if
