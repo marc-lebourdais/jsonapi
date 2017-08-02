@@ -177,7 +177,7 @@ type Employee struct {
 	HiredAt   *time.Time `json:"hired-at,iso8601"`
 }
 
-// Embeded Struct Models
+// Embedded Struct Models
 type Engine struct {
 	NumberOfCylinders uint `jsonapi:"attr,cylinders"`
 	HorsePower        uint `jsonapi:"attr,hp"`

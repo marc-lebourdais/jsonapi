@@ -756,7 +756,7 @@ func TestManyPayload_withLinks(t *testing.T) {
 	}
 }
 
-func TestEmbededStructs_nonNilStructPtr(t *testing.T) {
+func TestEmbeddedStructs_nonNilStructPtr(t *testing.T) {
 	originalVehicle := &Vehicle{
 		Make:  "VW",
 		Model: "R32",
@@ -806,7 +806,7 @@ func TestEmbededStructs_nonNilStructPtr(t *testing.T) {
 	}
 }
 
-func TestEmbededStructs_nilStructPtr(t *testing.T) {
+func TestEmbeddedStructs_nilStructPtr(t *testing.T) {
 	originalVehicle := &Vehicle{
 		Make:  "VW",
 		Model: "R32",
